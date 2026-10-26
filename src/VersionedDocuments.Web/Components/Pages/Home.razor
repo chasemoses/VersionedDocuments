@@ -1,0 +1,42 @@
+﻿@page "/"
+@using Microsoft.EntityFrameworkCore
+@inject IDbContextFactory<DocsDbContext> DbFactory
+
+<PageTitle>Equipment Documents</PageTitle>
+
+<h1>Equipment</h1>
+<p class="muted">Warranties, manuals, and photos attached to campus equipment, with full version history.</p>
+
+@if (_items is null)
+{
+    <p>Loading…</p>
+}
+else
+{
+    <table class="grid">
+        <thead><tr><th>Tag</th><th>Name</th><th class="num">Documents</th></tr></thead>
+        <tbody>
+            @foreach (var i in _items)
+            {
+                <tr>
+                    <td><a href="items/@i.Id">@i.Tag</a></td>
+                    <td>@i.Name</td>
+                    <td class="num">@i.Count</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private sealed record Row(int Id, string Tag, string Name, int Count);
+    private List<Row>? _items;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        _items = await db.EquipmentItems.OrderBy(i => i.Tag)
+            .Select(i => new Row(i.Id, i.Tag, i.Name, i.Documents.Count(d => d.RemovedAt == null)))
+            .ToListAsync();
+    }
+}

@@ -1,0 +1,261 @@
+@page "/items/{Id:int}"
+@using Microsoft.EntityFrameworkCore
+@inject IDbContextFactory<DocsDbContext> DbFactory
+@inject DocumentService Docs
+@inject DocumentOptions Options
+@inject CurrentUser User
+
+<PageTitle>@(_item?.Tag ?? "Item")</PageTitle>
+
+<p><a href="">← All equipment</a></p>
+
+@if (_item is null)
+{
+    <p>Equipment item not found.</p>
+}
+else
+{
+
+<h1>@_item.Tag <span class="muted">@_item.Name</span></h1>
+
+@if (_message is not null)
+{
+    <div class="alert @(_messageIsError ? "error" : "ok")" role="status">@_message</div>
+}
+
+<section class="card">
+    <h2>Attach a document</h2>
+    <div class="form-row">
+        <label>Title <input @bind="_newTitle" placeholder="e.g. Warranty certificate" /></label>
+        <label>Note <input @bind="_newComment" placeholder="optional" /></label>
+    </div>
+    <div class="form-row">
+        <InputFile OnChange="f => _newFile = f.File" />
+        <button class="primary" disabled="@(_busy || _newFile is null)" @onclick="CreateAsync">Upload</button>
+    </div>
+    <p class="hint">PNG, JPEG, GIF, PDF, or plain text, up to @(Options.MaxBytes / (1024 * 1024)) MB. The file type is checked from its content, not its name.</p>
+</section>
+
+<div class="list-header">
+    <h2>Documents</h2>
+    <label class="toggle"><input type="checkbox" checked="@_showRemoved" @onchange="ToggleRemovedAsync" /> Show removed</label>
+</div>
+
+@if (_docs.Count == 0)
+{
+    <p class="muted">No documents yet.</p>
+}
+
+@foreach (var d in _docs)
+{
+    var current = d.Versions.First();
+    <article class="doc @(d.IsRemoved ? "removed" : "")">
+        <div class="doc-main">
+            <div>
+                <div class="doc-title">@d.Title <span class="badge">v@(d.CurrentVersionNumber)</span> <span class="badge kind">@current.Kind</span></div>
+                <div class="muted small">
+                    @current.FileName · @Size(current.SizeBytes) · @current.UploadedBy · @current.UploadedAt.ToLocalTime().ToString("MMM d, yyyy h:mm tt")
+                </div>
+                @if (d.IsRemoved)
+                {
+                    <div class="removed-note">Removed by @d.RemovedBy: “@d.RemovedReason”</div>
+                }
+            </div>
+            <div class="actions">
+                @if (!d.IsRemoved)
+                {
+                    <a class="button" href="documents/@d.Id/versions/@d.CurrentVersionNumber">Download</a>
+                    <button @onclick="() => Open(d.Id, Panel.NewVersion)">New version</button>
+                    <button @onclick="() => Open(d.Id, Panel.Remove)">Remove</button>
+                }
+                else
+                {
+                    <button @onclick="() => RestoreAsync(d.Id)">Restore</button>
+                }
+                <button @onclick="() => Open(d.Id, Panel.History)">History (@d.Versions.Count)</button>
+            </div>
+        </div>
+
+        @if (_openDoc == d.Id && _panel == Panel.NewVersion)
+        {
+            <div class="panel">
+                <p class="small">Uploading on top of <strong>v@(d.CurrentVersionNumber)</strong>. If someone else uploads first, you'll be asked to review theirs.</p>
+                <div class="form-row">
+                    <InputFile OnChange="f => _versionFile = f.File" />
+                    <input @bind="_versionComment" placeholder="What changed?" />
+                    <button class="primary" disabled="@(_busy || _versionFile is null)" @onclick="() => AddVersionAsync(d.Id, d.CurrentVersionNumber)">Upload v@(d.CurrentVersionNumber + 1)</button>
+                </div>
+            </div>
+        }
+        else if (_openDoc == d.Id && _panel == Panel.Remove)
+        {
+            <div class="panel">
+                <div class="form-row">
+                    <input class="wide" @bind="_removeReason" placeholder="Reason (required, kept in the audit log)" />
+                    <button class="danger" disabled="@_busy" @onclick="() => RemoveAsync(d.Id)">Remove</button>
+                </div>
+            </div>
+        }
+        else if (_openDoc == d.Id && _panel == Panel.History)
+        {
+            <div class="panel history">
+                <table class="grid compact">
+                    <thead><tr><th>Version</th><th>File</th><th>Type</th><th class="num">Size</th><th>By</th><th>Note</th><th></th></tr></thead>
+                    <tbody>
+                        @foreach (var v in d.Versions)
+                        {
+                            <tr>
+                                <td>v@(v.VersionNumber)</td>
+                                <td>@v.FileName</td>
+                                <td>@v.Kind</td>
+                                <td class="num">@Size(v.SizeBytes)</td>
+                                <td>@v.UploadedBy</td>
+                                <td>@v.Comment</td>
+                                <td>
+                                    @if (!d.IsRemoved)
+                                    {
+                                        <a href="documents/@d.Id/versions/@v.VersionNumber">Download</a>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                <h3>Audit log</h3>
+                <ul class="audit">
+                    @foreach (var a in _history)
+                    {
+                        <li><span class="muted">@a.At.ToLocalTime().ToString("MMM d h:mm tt")</span> <strong>@a.Action</strong> by @a.Actor @(a.Detail is null ? "" : $"— {a.Detail}")</li>
+                    }
+                </ul>
+            </div>
+        }
+    </article>
+}
+
+}
+
+@code {
+    private enum Panel { None, NewVersion, Remove, History }
+
+    [Parameter] public int Id { get; set; }
+
+    private EquipmentItem? _item;
+    private List<Document> _docs = [];
+    private List<AuditEntry> _history = [];
+    private bool _showRemoved;
+    private bool _busy;
+    private string? _message;
+    private bool _messageIsError;
+
+    private string _newTitle = "";
+    private string? _newComment;
+    private IBrowserFile? _newFile;
+
+    private int? _openDoc;
+    private Panel _panel;
+    private IBrowserFile? _versionFile;
+    private string? _versionComment;
+    private string _removeReason = "";
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        _item = await db.EquipmentItems.AsNoTracking().SingleOrDefaultAsync(i => i.Id == Id);
+        await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        _docs = await Docs.ListAsync(Id, _showRemoved);
+        if (_openDoc is int id && _panel == Panel.History) _history = await Docs.HistoryAsync(id);
+    }
+
+    private async Task ToggleRemovedAsync(ChangeEventArgs e)
+    {
+        _showRemoved = (bool)e.Value!;
+        await ReloadAsync();
+    }
+
+    private async Task Open(int docId, Panel panel)
+    {
+        if (_openDoc == docId && _panel == panel)
+        {
+            _openDoc = null;
+            _panel = Panel.None;
+        }
+        else
+        {
+            _openDoc = docId;
+            _panel = panel;
+        }
+        _versionFile = null;
+        _versionComment = null;
+        _removeReason = "";
+        if (_panel == Panel.History) _history = await Docs.HistoryAsync(docId);
+    }
+
+    private Task CreateAsync() => RunAsync(async () =>
+    {
+        await using var s = OpenUpload(_newFile!);
+        await Docs.CreateAsync(Id, _newTitle, _newFile!.Name, s, User.Name, _newComment);
+        var title = _newTitle.Trim();
+        (_newTitle, _newComment, _newFile) = ("", null, null);
+        return $"Attached “{title}”.";
+    });
+
+    private Task AddVersionAsync(int docId, int expected) => RunAsync(async () =>
+    {
+        await using var s = OpenUpload(_versionFile!);
+        var v = await Docs.AddVersionAsync(docId, expected, _versionFile!.Name, s, User.Name, _versionComment);
+        (_openDoc, _panel) = (null, Panel.None);
+        return $"Uploaded version {v.VersionNumber}.";
+    });
+
+    private Task RemoveAsync(int docId) => RunAsync(async () =>
+    {
+        await Docs.RemoveAsync(docId, User.Name, _removeReason);
+        (_openDoc, _panel) = (null, Panel.None);
+        return "Removed. It can be restored from “Show removed”.";
+    });
+
+    private Task RestoreAsync(int docId) => RunAsync(async () =>
+    {
+        await Docs.RestoreAsync(docId, User.Name);
+        return "Restored.";
+    });
+
+    /// <summary>
+    /// Blazor refuses streams over the limit we pass; pass one byte more than ours so the
+    /// service's friendlier size message is the one users see.
+    /// </summary>
+    private Stream OpenUpload(IBrowserFile file)
+    {
+        if (file.Size > Options.MaxBytes)
+            throw new DocumentException($"Files can be at most {Options.MaxBytes / (1024 * 1024)} MB.");
+        return file.OpenReadStream(Options.MaxBytes + 1);
+    }
+
+    /// <summary>Expected failures become a message; anything else is a real bug and is allowed to surface.</summary>
+    private async Task RunAsync(Func<Task<string>> action)
+    {
+        _busy = true;
+        try
+        {
+            _message = await action();
+            _messageIsError = false;
+        }
+        catch (DocumentException ex)
+        {
+            _message = ex.Message;
+            _messageIsError = true;
+        }
+        finally
+        {
+            _busy = false;
+            await ReloadAsync();
+        }
+    }
+
+    private static string Size(long bytes) => Format.Size(bytes);
+}
